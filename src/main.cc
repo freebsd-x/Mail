@@ -17,6 +17,9 @@
 #include "xkit/widget.h"
 #include "xkit/application.h"
 #include "xkit/xbus_client.h"
+#include "xkit/fetch.h"
+#include "xkit/file_dialog.h"
+#include "xkit/media_file.h"
 #include "shared/protocol.h"
 #include <curl/curl.h>
 #include <memory>
@@ -33,6 +36,11 @@
 #include <thread>
 #include <mutex>
 #include <filesystem>
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/capsicum.h>
+#include <sys/stat.h>
 #include <ctime>
 
 using namespace fbx::xkit;
@@ -86,28 +94,110 @@ static std::function<void(const std::string&)> g_open_compose;  // pre-fill mail
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
-static fs::path mailRoot() {
+// The app is sandboxed: past start-up the one place it can reach on disk is its
+// own folder, opened (and limited to it) before the sandbox begins. Holds the
+// account passwords, so it's private to the user.
+static int g_store = -1;
+
+static void openStore() {
     const char* home = std::getenv("HOME");
-    return fs::path(home ? home : "/tmp") / ".freebsdx-mail";
+    const std::string root = std::string(home ? home : "/tmp") + "/.freebsdx-mail";
+    (void)::mkdir(root.c_str(), 0700);
+    (void)::chmod(root.c_str(), 0700);
+    g_store = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (g_store < 0) {
+        std::cerr << "[Mail] can't open " << root << ": " << std::strerror(errno) << "\n";
+        return;
+    }
+    cap_rights_t rights;
+    cap_rights_init(&rights, CAP_LOOKUP, CAP_CREATE, CAP_READ, CAP_WRITE, CAP_SEEK, CAP_FTRUNCATE, CAP_FSTAT,
+                    CAP_FSTATAT, CAP_FCNTL, CAP_FSYNC, CAP_MKDIRAT, CAP_RENAMEAT_SOURCE, CAP_RENAMEAT_TARGET);
+    (void)cap_rights_limit(g_store, &rights);
 }
 
-static fs::path accountsFile() { return mailRoot() / "accounts"; }
+static bool storeRead(const std::string& rel, std::string& out) {
+    fbx::xserver::UniqueFd fd(::openat(g_store, rel.c_str(), O_RDONLY | O_CLOEXEC));
+    return fd && readAllFd(fd.get(), out);
+}
 
-static fs::path folderDir(const MailAccount& a, const std::string& folder) {
-    return mailRoot() / a.id / folder;
+// All of it or none of it: written beside the file, then moved over it.
+static bool storeWrite(const std::string& rel, const std::string& data) {
+    const std::string tmp = rel + ".tmp";
+    fbx::xserver::UniqueFd fd(::openat(g_store, tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600));
+    if (!fd) return false;
+    for (size_t done = 0; done < data.size();) {
+        const ssize_t n = ::write(fd.get(), data.data() + done, data.size() - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        done += static_cast<size_t>(n);
+    }
+    if (::fsync(fd.get()) != 0) return false;
+    fd = {};
+    return ::renameat(g_store, tmp.c_str(), g_store, rel.c_str()) == 0;
+}
+
+static std::vector<std::string> storeList(const std::string& rel) {
+    std::vector<std::string> names;
+    const int fd = ::openat(g_store, rel.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return names;
+    DIR* dir = ::fdopendir(fd);
+    if (!dir) { ::close(fd); return names; }
+    while (dirent* e = ::readdir(dir))
+        names.emplace_back(e->d_name);
+    ::closedir(dir);
+    return names;
+}
+
+static std::string folderDir(const MailAccount& a, const std::string& folder) {
+    return a.id + "/" + folder;
 }
 
 static void ensureDirs(const MailAccount& a) {
+    (void)::mkdirat(g_store, a.id.c_str(), 0700);
     for (const char* f : {"INBOX", "Sent", "Drafts", "Trash"})
-        fs::create_directories(folderDir(a, f));
+        (void)::mkdirat(g_store, folderDir(a, f).c_str(), 0700);
+}
+
+static uint32_t toUint(const std::string& s, uint32_t fallback = 0) {
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(s.c_str(), &end, 10);
+    return end != s.c_str() ? static_cast<uint32_t>(v) : fallback;
+}
+
+// A message as this app stores it: headers, a blank line, the body.
+static MailMessage parseEml(const std::string& text) {
+    MailMessage msg;
+    std::istringstream f(text);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) break;
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        const std::string key = line.substr(0, colon);
+        std::string val = line.substr(colon + 1);
+        if (!val.empty() && val[0] == ' ') val.erase(0, 1);
+        if (key == "From")         msg.from     = val;
+        else if (key == "To")      msg.to       = val;
+        else if (key == "CC")      msg.cc       = val;
+        else if (key == "Subject") msg.subject  = val;
+        else if (key == "Date")    msg.date_str = val;
+        else if (key == "X-UID")   msg.uid      = toUint(val);
+        else if (key == "X-Read")  msg.read     = (val == "1");
+    }
+    std::ostringstream body;
+    while (std::getline(f, line)) body << line << '\n';
+    msg.body = body.str();
+    return msg;
 }
 
 // TSV format: id\tdisplay_name\temail\timap_host\timap_port\timap_ssl
 //             \tsmtp_host\tsmtp_port\tsmtp_ssl\tusername\tpassword
 static void loadAccounts() {
     g_accounts.clear();
-    std::ifstream f(accountsFile());
-    if (!f) return;
+    std::string text;
+    if (!storeRead("accounts", text)) return;
+    std::istringstream f(text);
     std::string line;
     while (std::getline(f, line)) {
         if (line.empty() || line[0] == '#') continue;
@@ -121,10 +211,10 @@ static void loadAccounts() {
         a.display_name = cols[1];
         a.email        = cols[2];
         a.imap_host    = cols[3];
-        a.imap_port    = static_cast<uint16_t>(std::stoul(cols[4]));
+        a.imap_port    = static_cast<uint16_t>(toUint(cols[4], 993));
         a.imap_ssl     = cols[5] == "1";
         a.smtp_host    = cols[6];
-        a.smtp_port    = static_cast<uint16_t>(std::stoul(cols[7]));
+        a.smtp_port    = static_cast<uint16_t>(toUint(cols[7], 587));
         a.smtp_ssl     = cols[8] == "1";
         a.username     = cols[9];
         a.password     = cols[10];
@@ -132,9 +222,8 @@ static void loadAccounts() {
     }
 }
 
-static void saveAccounts() {
-    fs::create_directories(mailRoot());
-    std::ofstream f(accountsFile(), std::ios::trunc);
+static bool saveAccounts() {
+    std::ostringstream f;
     for (const auto& a : g_accounts) {
         f << a.id           << '\t'
           << a.display_name << '\t'
@@ -148,13 +237,13 @@ static void saveAccounts() {
           << a.username     << '\t'
           << a.password     << '\n';
     }
+    return storeWrite("accounts", f.str());
 }
 
 // Save parsed message to local cache as .eml
 static void cacheMessage(const MailAccount& a, const std::string& folder,
                           const MailMessage& msg) {
-    auto path = folderDir(a, folder) / (std::to_string(msg.uid) + ".eml");
-    std::ofstream f(path, std::ios::trunc);
+    std::ostringstream f;
     f << "From: "    << msg.from    << "\r\n"
       << "To: "      << msg.to      << "\r\n"
       << "CC: "      << msg.cc      << "\r\n"
@@ -164,44 +253,19 @@ static void cacheMessage(const MailAccount& a, const std::string& folder,
       << "X-Read: "  << (msg.read ? "1" : "0") << "\r\n"
       << "\r\n"
       << msg.body;
+    (void)storeWrite(folderDir(a, folder) + "/" + std::to_string(msg.uid) + ".eml", f.str());
 }
 
 // Load messages from local cache for a folder
 static std::vector<MailMessage> loadCachedMessages(const MailAccount& a,
                                                     const std::string& folder) {
     std::vector<MailMessage> msgs;
-    auto dir = folderDir(a, folder);
-    if (!fs::is_directory(dir)) return msgs;
-
-    for (const auto& entry : fs::directory_iterator(dir)) {
-        if (entry.path().extension() != ".eml") continue;
-        std::ifstream f(entry.path());
-        if (!f) continue;
-
-        MailMessage msg;
-        // Read header lines until blank line
-        std::string line;
-        while (std::getline(f, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.empty()) break;
-            auto colon = line.find(':');
-            if (colon == std::string::npos) continue;
-            std::string key = line.substr(0, colon);
-            std::string val = line.substr(colon + 2); // skip ": "
-            if (key == "From")    msg.from     = val;
-            else if (key == "To")      msg.to      = val;
-            else if (key == "CC")      msg.cc      = val;
-            else if (key == "Subject") msg.subject = val;
-            else if (key == "Date")    msg.date_str= val;
-            else if (key == "X-UID")   msg.uid     = static_cast<uint32_t>(std::stoul(val));
-            else if (key == "X-Read")  msg.read    = (val == "1");
-        }
-        // Rest is body
-        std::ostringstream body_ss;
-        while (std::getline(f, line)) {
-            body_ss << line << '\n';
-        }
-        msg.body = body_ss.str();
+    const std::string dir = folderDir(a, folder);
+    for (const std::string& name : storeList(dir)) {
+        if (!name.ends_with(".eml")) continue;
+        std::string text;
+        if (!storeRead(dir + "/" + name, text)) continue;
+        MailMessage msg = parseEml(text);
         if (msg.uid > 0) msgs.push_back(std::move(msg));
     }
 
@@ -213,6 +277,74 @@ static std::vector<MailMessage> loadCachedMessages(const MailAccount& a,
 }
 
 // ── libcurl helpers ───────────────────────────────────────────────────────────
+
+// The sandbox can't resolve names or open sockets, so the compositor connects
+// and curl is given the socket: it thinks it's connecting to the address below.
+// Nor can it read the trusted certificates, so they're loaded before it begins.
+static std::string g_ca_certs;
+
+static void loadCaCerts() {
+    std::vector<std::string> places;
+    for (const char* var : {"CURL_CA_BUNDLE", "SSL_CERT_FILE"})
+        if (const char* p = std::getenv(var)) places.emplace_back(p);
+    places.emplace_back("/etc/ssl/cert.pem");
+    places.emplace_back("/usr/local/share/certs/ca-root-nss.crt");
+    for (const auto& place : places) {
+        std::ifstream f(place, std::ios::binary);
+        if (!f) continue;
+        g_ca_certs.assign(std::istreambuf_iterator<char>(f), {});
+        if (!g_ca_certs.empty()) return;
+    }
+    std::cerr << "[Mail] no trusted certificates found: secure connections will fail\n";
+}
+
+struct Connection {
+    std::string host;
+    uint16_t    port = 0;
+    std::string error;     // from the compositor, which curl doesn't know about
+    curl_slist* resolve = nullptr;
+    ~Connection() { curl_slist_free_all(resolve); }
+};
+
+static curl_socket_t openBrokered(void* data, curlsocktype, curl_sockaddr*) {
+    auto* c = static_cast<Connection*>(data);
+    ConnectResult r = connectBlocking(c->host, c->port);
+    if (!r.ok()) {
+        c->error = r.error.empty() ? "couldn't connect" : r.error;
+        return CURL_SOCKET_BAD;
+    }
+    return r.socket.release();   // curl closes it
+}
+
+static int alreadyConnected(void*, curl_socket_t, curlsocktype) {
+    return CURL_SOCKOPT_ALREADY_CONNECTED;
+}
+
+static void useConnection(CURL* curl, Connection& c, const std::string& host, uint16_t port) {
+    c.host = host;
+    c.port = port;
+    const std::string entry = host + ":" + std::to_string(port) + ":127.0.0.1";
+    c.resolve = curl_slist_append(nullptr, entry.c_str());
+    curl_easy_setopt(curl, CURLOPT_RESOLVE, c.resolve);
+    curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, openBrokered);
+    curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, &c);
+    curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, alreadyConnected);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_blob certs{g_ca_certs.data(), g_ca_certs.size(), CURL_BLOB_NOCOPY};
+    curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &certs);
+    curl_easy_setopt(curl, CURLOPT_CAPATH, nullptr);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    // Without TLS from the first byte (imaps, smtps), a password still doesn't
+    // cross the network in the clear; a server on this machine may do without.
+    const bool local = host == "localhost" || host == "127.0.0.1" || host == "::1";
+    curl_easy_setopt(curl, CURLOPT_USE_SSL, local ? CURLUSESSL_TRY : CURLUSESSL_ALL);
+}
+
+static std::string curlError(CURLcode rc, const Connection& c) {
+    return c.error.empty() ? curl_easy_strerror(rc) : c.error;
+}
+
 
 static size_t curlWrite(char* ptr, size_t sz, size_t nmemb, std::string* s) {
     s->append(ptr, sz * nmemb);
@@ -232,110 +364,158 @@ static size_t curlRead(char* ptr, size_t sz, size_t nmemb, SmtpUpload* up) {
 // ── Header parsing ────────────────────────────────────────────────────────────
 
 // Extract a header value from a raw RFC-822 header block (case-insensitive)
-static std::string rfcHeader(const std::string& raw, const std::string& name) {
-    std::string lraw = raw, lname = name + ":";
-    std::transform(lraw.begin(), lraw.end(), lraw.begin(), ::tolower);
-    std::transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
-    auto pos = lraw.find(lname);
-    if (pos == std::string::npos) return "";
-    pos += lname.size();
-    while (pos < raw.size() && (raw[pos] == ' ' || raw[pos] == '\t')) ++pos;
-    auto end = raw.find('\n', pos);
-    if (end == std::string::npos) end = raw.size();
-    std::string val = raw.substr(pos, end - pos);
-    if (!val.empty() && val.back() == '\r') val.pop_back();
-    return val;
-}
 
 // ── IMAP fetch (runs in background thread) ────────────────────────────────────
 
 // Parse a FETCH response block into MailMessages.
 // libcurl delivers each message as a separate write callback sequence;
 // by the time we see the full response buffer we split on "* N FETCH".
-static std::vector<MailMessage> parseImapFetch(const std::string& raw) {
-    std::vector<MailMessage> msgs;
+// Headers in mail may be RFC 2047 encoded: =?utf-8?B?...?= or =?utf-8?Q?...?=.
+static std::string decodeWords(const std::string& in) {
+    static const auto b64 = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        return c == '+' ? 62 : c == '/' ? 63 : -1;
+    };
+    std::string out;
     size_t pos = 0;
-    while (pos < raw.size()) {
-        // Find next "* N FETCH ("
-        auto fetch = raw.find("\r\n* ", pos);
-        if (fetch == std::string::npos) fetch = raw.find("\n* ", pos);
-        if (fetch == std::string::npos) {
-            if (pos == 0) {
-                // Maybe response starts with "* "
-                if (raw.starts_with("* ")) fetch = 0;
-                else break;
-            } else break;
+    bool after_word = false;
+    while (pos < in.size()) {
+        const size_t start = in.find("=?", pos);
+        size_t q1 = start == std::string::npos ? start : in.find('?', start + 2);
+        size_t q2 = q1 == std::string::npos ? q1 : in.find('?', q1 + 1);
+        size_t end = q2 == std::string::npos ? q2 : in.find("?=", q2 + 1);
+        if (end == std::string::npos) { out += in.substr(pos); break; }
+        const std::string between = in.substr(pos, start - pos);
+        // Only space separates two encoded words: it isn't part of the text.
+        if (!after_word || between.find_first_not_of(" \t\r\n") != std::string::npos) out += between;
+        const char enc = static_cast<char>(std::toupper(static_cast<unsigned char>(in[q1 + 1])));
+        const std::string text = in.substr(q2 + 1, end - q2 - 1);
+        if (enc == 'B') {
+            uint32_t bits = 0;
+            int have = 0;
+            for (char c : text) {
+                const int v = b64(c);
+                if (v < 0) continue;
+                bits = (bits << 6) | static_cast<uint32_t>(v);
+                have += 6;
+                if (have >= 8) { have -= 8; out += static_cast<char>((bits >> have) & 0xFF); }
+            }
         } else {
-            fetch += (raw[fetch + 1] == '\n') ? 2 : 3; // skip \r\n or \n
-        }
-        // Find the literal size marker "{N}\r\n" or just the header block end
-        auto brace = raw.find('{', fetch);
-        auto next_fetch = raw.find("\n* ", fetch + 2);
-        if (brace == std::string::npos ||
-            (next_fetch != std::string::npos && brace > next_fetch)) {
-            pos = (next_fetch != std::string::npos) ? next_fetch : raw.size();
-            continue;
-        }
-
-        auto brace_end = raw.find('}', brace);
-        if (brace_end == std::string::npos) break;
-        size_t literal_sz = 0;
-        try { literal_sz = std::stoul(raw.substr(brace + 1, brace_end - brace - 1)); }
-        catch (...) { pos = brace_end + 1; continue; }
-
-        // Skip past "\r\n" after "}"
-        size_t hdr_start = brace_end + 1;
-        if (hdr_start < raw.size() && raw[hdr_start] == '\r') ++hdr_start;
-        if (hdr_start < raw.size() && raw[hdr_start] == '\n') ++hdr_start;
-
-        if (hdr_start + literal_sz > raw.size()) break;
-        std::string header_block = raw.substr(hdr_start, literal_sz);
-
-        // Extract UID from "* N FETCH (UID N …)" or sequence number
-        MailMessage msg;
-        // Try to find UID in fetch response
-        auto uid_kw = raw.find("UID ", fetch);
-        if (uid_kw != std::string::npos && uid_kw < hdr_start) {
-            try { msg.uid = std::stoul(raw.substr(uid_kw + 4)); } catch (...) {}
-        }
-        if (msg.uid == 0) {
-            // Use sequence number from "* N FETCH"
-            auto star = raw.rfind("* ", brace);
-            if (star != std::string::npos) {
-                try { msg.uid = std::stoul(raw.substr(star + 2)); } catch (...) {}
+            for (size_t i = 0; i < text.size(); ++i) {
+                if (text[i] == '_') out += ' ';
+                else if (text[i] == '=' && i + 2 < text.size()) {
+                    out += static_cast<char>(std::strtol(text.substr(i + 1, 2).c_str(), nullptr, 16));
+                    i += 2;
+                } else out += text[i];
             }
         }
-
-        msg.from     = rfcHeader(header_block, "From");
-        msg.to       = rfcHeader(header_block, "To");
-        msg.cc       = rfcHeader(header_block, "CC");
-        msg.subject  = rfcHeader(header_block, "Subject");
-        msg.date_str = rfcHeader(header_block, "Date");
-        // Check for attachments (simplified: Content-Type multipart)
-        std::string ct = rfcHeader(header_block, "Content-Type");
-        std::transform(ct.begin(), ct.end(), ct.begin(), ::tolower);
-        msg.has_attachment = ct.find("multipart") != std::string::npos;
-
-        if (!msg.from.empty() || !msg.subject.empty())
-            msgs.push_back(std::move(msg));
-
-        pos = hdr_start + literal_sz;
+        pos = end + 2;
+        after_word = true;
     }
+    return out;
+}
+
+// An IMAP value: an atom, a string or NIL (empty), or a (list).
+struct ImapValue {
+    std::string text;
+    std::vector<ImapValue> list;
+};
+
+static ImapValue parseImapValue(const std::string& s, size_t& pos) {
+    ImapValue v;
+    while (pos < s.size() && s[pos] == ' ') ++pos;
+    if (pos >= s.size()) return v;
+    if (s[pos] == '(') {
+        ++pos;
+        while (pos < s.size() && s[pos] != ')') {
+            size_t before = pos;
+            v.list.push_back(parseImapValue(s, pos));
+            while (pos < s.size() && s[pos] == ' ') ++pos;
+            if (pos == before) break;
+        }
+        if (pos < s.size()) ++pos;
+    } else if (s[pos] == '"') {
+        for (++pos; pos < s.size() && s[pos] != '"'; ++pos) {
+            if (s[pos] == '\\' && pos + 1 < s.size()) ++pos;
+            v.text += s[pos];
+        }
+        if (pos < s.size()) ++pos;
+    } else {
+        while (pos < s.size() && s[pos] != ' ' && s[pos] != ')' && s[pos] != '(') v.text += s[pos++];
+        if (v.text == "NIL") v.text.clear();
+    }
+    return v;
+}
+
+// ("name" adl "mailbox" "host") ... as "name <mailbox@host>", comma-separated.
+static std::string imapAddresses(const ImapValue& v) {
+    std::string out;
+    for (const auto& a : v.list) {
+        if (a.list.size() < 4) continue;
+        const std::string addr = a.list[2].text + "@" + a.list[3].text;
+        const std::string name = decodeWords(a.list[0].text);
+        if (!out.empty()) out += ", ";
+        out += name.empty() ? addr : name + " <" + addr + ">";
+    }
+    return out;
+}
+
+// What `UID FETCH ... (UID FLAGS BODYSTRUCTURE ENVELOPE)` answers, one per line:
+// curl hands over only a command's "* " lines, which is why it's this and not the
+// raw headers, and why a value the server sends as a literal comes out empty.
+static std::vector<MailMessage> parseImapFetch(const std::string& raw) {
+    std::vector<MailMessage> msgs;
+    std::istringstream lines(raw);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.starts_with("* ") || line.find(" FETCH ") == std::string::npos) continue;
+        MailMessage msg;
+        if (auto at = line.find("UID "); at != std::string::npos) msg.uid = toUint(line.substr(at + 4));
+        if (msg.uid == 0) continue;
+        if (auto at = line.find("FLAGS ("); at != std::string::npos) {
+            const auto end = line.find(')', at);
+            msg.read = line.substr(at, end - at).find("\\Seen") != std::string::npos;
+        }
+        if (auto at = line.find("BODYSTRUCTURE ("); at != std::string::npos) {
+            std::string upper = line.substr(at);
+            std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+            msg.has_attachment = upper.find("\"MIXED\"") != std::string::npos;
+        }
+        if (auto at = line.find("ENVELOPE ("); at != std::string::npos) {
+            size_t pos = at + 9;
+            const ImapValue env = parseImapValue(line, pos);
+            // date subject from sender reply-to to cc ...
+            if (env.list.size() >= 7) {
+                msg.date_str = env.list[0].text;
+                msg.subject  = decodeWords(env.list[1].text);
+                msg.from     = imapAddresses(env.list[2]);
+                msg.to       = imapAddresses(env.list[5]);
+                msg.cc       = imapAddresses(env.list[6]);
+            }
+        }
+        msgs.push_back(std::move(msg));
+    }
+    std::sort(msgs.begin(), msgs.end(),
+              [](const MailMessage& a, const MailMessage& b) { return a.uid > b.uid; });
     return msgs;
 }
 
 // Fetch message body for UID; returns plain-text content.
-static std::string fetchBody(const MailAccount& acct,
-                              const std::string& folder, uint32_t uid) {
+static bool fetchBody(const MailAccount& acct,
+                      const std::string& folder, uint32_t uid, std::string& out) {
     CURL* curl = curl_easy_init();
-    if (!curl) return "";
+    if (!curl) return false;
 
     std::string url = std::string(acct.imap_ssl ? "imaps" : "imap")
                     + "://" + acct.imap_host
                     + ":" + std::to_string(acct.imap_port)
-                    + "/" + folder + "/;UID=" + std::to_string(uid);
+                    + "/" + folder + "/;UID=" + std::to_string(uid) + ";SECTION=TEXT";
 
     std::string response;
+    Connection conn;
+    useConnection(curl, conn, acct.imap_host, acct.imap_port);
     curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
     curl_easy_setopt(curl, CURLOPT_USERNAME,       acct.username.c_str());
     curl_easy_setopt(curl, CURLOPT_PASSWORD,       acct.password.c_str());
@@ -344,19 +524,22 @@ static std::string fetchBody(const MailAccount& acct,
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,        20L);
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST,
-                     ("UID FETCH " + std::to_string(uid) + " BODY[TEXT]").c_str());
 
     CURLcode rc = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
-    return (rc == CURLE_OK) ? response : "";
+    if (rc != CURLE_OK) {
+        out = "(Couldn't load this message: " + curlError(rc, conn) + ")";
+        return false;
+    }
+    out = std::move(response);
+    return true;
 }
 
 // Background sync: fetch headers for the active folder.
 static void syncFolder(const MailAccount& acct, const std::string& folder,
-                       std::function<void(std::vector<MailMessage>)> done_cb) {
+                       std::function<void(std::vector<MailMessage>, std::string)> done_cb) {
     CURL* curl = curl_easy_init();
-    if (!curl) { done_cb({}); return; }
+    if (!curl) { done_cb({}, "curl init failed"); return; }
 
     std::string url = std::string(acct.imap_ssl ? "imaps" : "imap")
                     + "://" + acct.imap_host
@@ -364,6 +547,8 @@ static void syncFolder(const MailAccount& acct, const std::string& folder,
                     + "/" + folder;
 
     std::string response;
+    Connection conn;
+    useConnection(curl, conn, acct.imap_host, acct.imap_port);
     curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
     curl_easy_setopt(curl, CURLOPT_USERNAME,       acct.username.c_str());
     curl_easy_setopt(curl, CURLOPT_PASSWORD,       acct.password.c_str());
@@ -372,31 +557,58 @@ static void syncFolder(const MailAccount& acct, const std::string& folder,
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,        30L);
-    // Fetch headers for all messages (newest 50 via RECENT or 1:* limited by server)
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST,
-                     "UID FETCH 1:* (FLAGS RFC822.HEADER)");
-
+    // The newest messages: which they are, then those (without marking them read).
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "UID SEARCH ALL");
     CURLcode rc = curl_easy_perform(curl);
+    if (rc == CURLE_OK) {
+        constexpr size_t kNewest = 50;
+        std::vector<std::string> uids;
+        if (auto at = response.find("* SEARCH"); at != std::string::npos) {
+            std::istringstream found(response.substr(at + 8, response.find('\n', at) - at - 8));
+            for (std::string uid; found >> uid;) uids.push_back(uid);
+        }
+        std::string wanted;
+        for (size_t i = uids.size() > kNewest ? uids.size() - kNewest : 0; i < uids.size(); ++i)
+            wanted += (wanted.empty() ? "" : ",") + uids[i];
+        response.clear();
+        if (!wanted.empty()) {
+            const std::string fetch = "UID FETCH " + wanted + " (UID FLAGS BODYSTRUCTURE ENVELOPE)";
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, fetch.c_str());
+            rc = curl_easy_perform(curl);
+        }
+    }
     curl_easy_cleanup(curl);
 
-    if (rc != CURLE_OK) { done_cb({}); return; }
+    if (rc != CURLE_OK) { done_cb({}, curlError(rc, conn)); return; }
 
     auto msgs = parseImapFetch(response);
     // Cache fetched headers locally
     if (g_active_account >= 0 && g_active_account < (int)g_accounts.size()) {
         ensureDirs(acct);
-        for (const auto& m : msgs)
+        for (auto& m : msgs) {
+            // A body read earlier is still good: this only brought the headers.
+            std::string kept;
+            if (storeRead(folderDir(acct, folder) + "/" + std::to_string(m.uid) + ".eml", kept))
+                m.body = parseEml(kept).body;
             cacheMessage(acct, folder, m);
+        }
     }
-    done_cb(std::move(msgs));
+    done_cb(std::move(msgs), {});
 }
 
 // ── SMTP send ─────────────────────────────────────────────────────────────────
 
+constexpr size_t kMaxAttachment = 25u << 20;   // what mail servers commonly accept
+
+struct Attachment {
+    std::string name;
+    std::string data;
+};
+
 static bool sendSmtp(const MailAccount& acct,
                      const std::string& to, const std::string& cc,
                      const std::string& subject, const std::string& body,
-                     const std::vector<std::string>& attachments,
+                     const std::vector<Attachment>& attachments,
                      std::string& out_err) {
     CURL* curl = curl_easy_init();
     if (!curl) { out_err = "curl init failed"; return false; }
@@ -423,30 +635,29 @@ static bool sendSmtp(const MailAccount& acct,
                << "Content-Transfer-Encoding: 8bit\r\n"
                << "\r\n"
                << body << "\r\n";
-        for (const auto& att_path : attachments) {
-            std::ifstream af(att_path, std::ios::binary);
-            if (!af) continue;
-            std::string att_data((std::istreambuf_iterator<char>(af)),
-                                  std::istreambuf_iterator<char>());
-            std::string att_name = fs::path(att_path).filename().string();
+        for (const auto& att : attachments) {
+            std::string att_name = att.name;   // it goes between quotes in a header
+            for (char& c : att_name)
+                if (c == '"' || c == '\\' || static_cast<unsigned char>(c) < 0x20) c = '_';
             msg_ss << "--" << boundary << "\r\n"
                    << "Content-Type: application/octet-stream\r\n"
                    << "Content-Disposition: attachment; filename=\"" << att_name << "\"\r\n"
                    << "Content-Transfer-Encoding: base64\r\n"
                    << "\r\n";
-            // Base64 encode (simple implementation)
             static const char* b64chars =
                 "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            const uint8_t* in = reinterpret_cast<const uint8_t*>(att_data.data());
-            size_t len = att_data.size(), i = 0, col = 0;
-            while (i < len) {
-                uint32_t b  = in[i++] << 16;
-                if (i < len) b |= in[i++] << 8;
-                if (i < len) b |= in[i++];
+            const auto* in = reinterpret_cast<const uint8_t*>(att.data.data());
+            const size_t len = att.data.size();
+            size_t col = 0;
+            for (size_t i = 0; i < len; i += 3) {
+                const size_t left = len - i;
+                uint32_t b = uint32_t{in[i]} << 16;
+                if (left > 1) b |= uint32_t{in[i + 1]} << 8;
+                if (left > 2) b |= in[i + 2];
                 msg_ss << b64chars[(b >> 18) & 63]
                        << b64chars[(b >> 12) & 63]
-                       << b64chars[(b >>  6) & 63]
-                       << b64chars[(b      ) & 63];
+                       << (left > 1 ? b64chars[(b >> 6) & 63] : '=')
+                       << (left > 2 ? b64chars[b & 63] : '=');
                 col += 4;
                 if (col >= 76) { msg_ss << "\r\n"; col = 0; }
             }
@@ -479,6 +690,8 @@ static bool sendSmtp(const MailAccount& acct,
     if (!cc.empty()) add_rcpts(cc);
 
     std::string from_addr = "<" + acct.email + ">";
+    Connection conn;
+    useConnection(curl, conn, acct.smtp_host, acct.smtp_port);
     curl_easy_setopt(curl, CURLOPT_URL,           smtp_url.c_str());
     curl_easy_setopt(curl, CURLOPT_USERNAME,       acct.username.c_str());
     curl_easy_setopt(curl, CURLOPT_PASSWORD,       acct.password.c_str());
@@ -494,7 +707,7 @@ static bool sendSmtp(const MailAccount& acct,
     curl_slist_free_all(rcpts);
     curl_easy_cleanup(curl);
 
-    if (rc != CURLE_OK) { out_err = curl_easy_strerror(rc); return false; }
+    if (rc != CURLE_OK) { out_err = curlError(rc, conn); return false; }
     return true;
 }
 
@@ -626,11 +839,26 @@ static std::shared_ptr<Widget> buildAddAccountForm(
     return form;
 }
 
+// A sync finished, on the UI thread. A failure says why and leaves what's shown.
+static std::string g_sync_error;
+
+static void finishSync(std::vector<MailMessage> msgs, std::string err) {
+    g_sync_error = std::move(err);
+    if (g_sync_error.empty()) {
+        std::lock_guard<std::mutex> lock(g_msg_mutex);
+        g_messages = std::move(msgs);
+    }
+    g_syncing = false;
+    if (g_rebuild_msg_list) g_rebuild_msg_list();
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
+    openStore();
+    loadCaCerts();
     loadAccounts();
     if (!g_accounts.empty()) g_active_account = 0;
 
@@ -639,10 +867,9 @@ int main(int argc, char** argv) {
     auto compose_cc      = std::make_shared<std::string>("");
     auto compose_subject = std::make_shared<std::string>("");
     auto compose_body    = std::make_shared<std::string>("");
-    auto compose_attachments = std::make_shared<std::vector<std::string>>();
+    auto compose_attachments = std::make_shared<std::vector<Attachment>>();
     auto compose_mode    = std::make_shared<bool>(false);
     auto status_text     = std::make_shared<std::string>("");
-    auto chooser_req     = std::make_shared<uint32_t>(0);
 
     // ── Left pane ─────────────────────────────────────────────────────────────
     auto left = std::make_shared<FlexColumn>(std::vector<std::shared_ptr<Widget>>{});
@@ -685,13 +912,10 @@ int main(int argc, char** argv) {
             const MailAccount acct = g_accounts[g_active_account];
             const std::string folder = g_active_folder;
             std::thread([acct, folder]() {
-                syncFolder(acct, folder, [](std::vector<MailMessage> msgs) {
-                    {
-                        std::lock_guard<std::mutex> lock(g_msg_mutex);
-                        g_messages = std::move(msgs);
-                    }
-                    g_syncing = false;
-                    if (g_rebuild_msg_list) g_rebuild_msg_list();
+                syncFolder(acct, folder, [](std::vector<MailMessage> msgs, std::string err) {
+                    XApplication::post([msgs = std::move(msgs), err = std::move(err)]() mutable {
+                        finishSync(std::move(msgs), std::move(err));
+                    });
                 });
             }).detach();
         });
@@ -775,9 +999,10 @@ int main(int argc, char** argv) {
                 [=](MailAccount a) {
                     g_accounts.push_back(std::move(a));
                     g_active_account = static_cast<int>(g_accounts.size()) - 1;
-                    saveAccounts();
+                    const bool saved = saveAccounts();
                     ensureDirs(g_accounts[g_active_account]);
-                    acct_label->setText(g_accounts[g_active_account].email);
+                    acct_label->setText(g_accounts[g_active_account].email +
+                                        (saved ? "" : " (not saved)"));
                     g_selected_msg = -1;
                     if (g_rebuild_folder_list) g_rebuild_folder_list();
                     if (g_rebuild_right_pane)  g_rebuild_right_pane();
@@ -835,14 +1060,14 @@ int main(int argc, char** argv) {
                     std::string cc      = *compose_cc;
                     std::string subject = *compose_subject;
                     std::string body    = *compose_body;
-                    std::vector<std::string> atts = *compose_attachments;
+                    std::vector<Attachment> atts = *compose_attachments;
                     send_status->setText("Sending…");
                     std::thread([=]() {
                         std::string err;
                         bool ok = sendSmtp(acct, to, cc, subject, body, atts, err);
-                        try {
+                        XApplication::post([send_status, ok, err] {
                             send_status->setText(ok ? "Sent!" : ("Error: " + err));
-                        } catch (...) {}
+                        });
                         if (ok) {
                             // Cache in Sent folder
                             MailMessage sent;
@@ -908,18 +1133,18 @@ int main(int argc, char** argv) {
                 std::make_shared<TextWidget>("Attach…", 11.0f),
                 [=, att_list_lbl=att_list_lbl]() {
                     if (!g_xbus) return;
-                    FileChooserRequest req{};
-                    req.opcode_       = static_cast<uint32_t>(
-                                            FileChooserOpcode::OpenFiles);
-                    req.multi_select_ = 1;
-                    std::strncpy(req.title_, "Attach Files", sizeof(req.title_) - 1);
-                    static uint32_t s_req_id = 1000;
-                    req.request_id_   = ++s_req_id;
-                    *chooser_req      = s_req_id;
-                    g_xbus->Call("com.freebsdx.FileChooser",
-                                 static_cast<uint32_t>(FileChooserOpcode::OpenFiles),
-                                 {reinterpret_cast<const uint8_t*>(&req), sizeof(req)},
-                                 nullptr);
+                    // The sandbox opens no paths: the user picks, and it's read at once.
+                    XFileDialog::pickToOpen(*g_xbus, "Attach File", "", [=](XFileDialog::Picked p) {
+                        if (p.cancelled) return;
+                        std::string data;
+                        if (!p.fd || !readAllFd(p.fd.get(), data, kMaxAttachment)) {
+                            att_list_lbl->setText("Couldn't attach that file" +
+                                                  (p.error.empty() ? std::string{} : ": " + p.error));
+                            return;
+                        }
+                        compose_attachments->push_back({fs::path(p.path).filename().string(), std::move(data)});
+                        att_list_lbl->setText(std::to_string(compose_attachments->size()) + " file(s)");
+                    });
                 });
             att_btn->setFixedSize(70.0f, 26.0f);
             att_row->addChild(att_lbl);
@@ -1039,15 +1264,18 @@ int main(int argc, char** argv) {
                 uint32_t uid = msg.uid;
                 int sel = g_selected_msg;
                 std::thread([acct, uid, sel]() {
-                    std::string body = fetchBody(acct, g_active_folder, uid);
-                    try {
-                        std::lock_guard<std::mutex> lock(g_msg_mutex);
-                        if (sel < (int)g_messages.size() && g_messages[sel].uid == uid) {
-                            g_messages[sel].body = body;
-                            cacheMessage(acct, g_active_folder, g_messages[sel]);
+                    std::string body;
+                    const bool got = fetchBody(acct, g_active_folder, uid, body);
+                    XApplication::post([acct, uid, sel, got, body = std::move(body)] {
+                        {
+                            std::lock_guard<std::mutex> lock(g_msg_mutex);
+                            if (sel >= 0 && sel < (int)g_messages.size() && g_messages[sel].uid == uid) {
+                                g_messages[sel].body = body.empty() ? "(This message has no text.)" : body;
+                                if (got) cacheMessage(acct, g_active_folder, g_messages[sel]);
+                            }
                         }
-                    } catch (...) {}
-                    if (g_rebuild_right_pane) g_rebuild_right_pane();
+                        if (g_rebuild_right_pane) g_rebuild_right_pane();
+                    });
                 }).detach();
             }
         }
@@ -1070,6 +1298,9 @@ int main(int argc, char** argv) {
         msg_list_col->clearChildren();
 
         std::lock_guard<std::mutex> lock(g_msg_mutex);
+        status_lbl->setText(g_sync_error.empty()
+            ? std::to_string(g_messages.size()) + " messages" + (g_syncing ? "  ⟳" : "")
+            : "Sync failed: " + g_sync_error);
         if (g_messages.empty()) {
             auto lbl = std::make_shared<TextWidget>(
                 g_syncing ? "Syncing…" : "No messages", 12.0f);
@@ -1155,8 +1386,6 @@ int main(int argc, char** argv) {
             msg_list_col->addChild(clickable);
         }
 
-        status_lbl->setText(std::to_string(g_messages.size()) + " messages"
-                            + (g_syncing ? "  ⟳" : ""));
     };
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1266,7 +1495,12 @@ int main(int argc, char** argv) {
 
     // ── Pre-load command-line file ────────────────────────────────────────────
     std::string preload_path;
-    if (argc >= 2) preload_path = argv[1];
+    // xshell opens files with "--open <path>"; a bare path works too.
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--open") { if (i + 1 < argc) preload_path = argv[i + 1]; break; }
+        if (!a.empty() && a[0] != '-') { preload_path = a; break; }
+    }
 
     // ── Initial render ────────────────────────────────────────────────────────
     g_rebuild_folder_list();
@@ -1298,71 +1532,34 @@ int main(int argc, char** argv) {
             reg_mime("message/rfc822");
             reg_mime("x-scheme-handler/mailto");
 
-            // Combined broadcast handler: LaunchWithFile + FileChooser responses
+            // A mailto: link opened while this window runs.
             xbus.OnBroadcast([=](const XBusMessage& bcast) {
-                // ── LaunchWithFile (Shell → open .eml or mailto: URI) ─────
-                if (std::strcmp(bcast.service_name_, "com.freebsdx.Shell") == 0 &&
-                    bcast.opcode_ == static_cast<uint32_t>(ShellOpcode::LaunchWithFile))
-                {
-                    ShellLaunchRequest req{};
-                    std::memcpy(&req, bcast.payload_, sizeof(req));
-                    req.app_id_[sizeof(req.app_id_) - 1]       = '\0';
-                    req.file_path_[sizeof(req.file_path_) - 1] = '\0';
-
-                    if (std::strcmp(req.app_id_, "com.freebsdx.mail") != 0) return;
-
-                    std::string path = req.file_path_;
-                    if (path.starts_with("mailto:")) {
-                        if (g_open_compose) g_open_compose(path);
-                        return;
-                    }
-                    // .eml file → parse and display
-                    std::ifstream f(path);
-                    if (!f) return;
-                    MailMessage msg_local;
-                    msg_local.uid = static_cast<uint32_t>(std::time(nullptr));
-                    std::string line;
-                    while (std::getline(f, line)) {
-                        if (!line.empty() && line.back() == '\r') line.pop_back();
-                        if (line.empty()) break;
-                        auto colon = line.find(':');
-                        if (colon == std::string::npos) continue;
-                        std::string key = line.substr(0, colon);
-                        std::string val = line.substr(colon + 2);
-                        if (key == "From")         msg_local.from     = val;
-                        else if (key == "To")      msg_local.to       = val;
-                        else if (key == "Subject") msg_local.subject  = val;
-                        else if (key == "Date")    msg_local.date_str = val;
-                    }
-                    std::ostringstream body_ss;
-                    while (std::getline(f, line)) body_ss << line << '\n';
-                    msg_local.body = body_ss.str();
-                    {
-                        std::lock_guard<std::mutex> l(g_msg_mutex);
-                        g_messages.insert(g_messages.begin(), msg_local);
-                        g_selected_msg = 0;
-                    }
-                    if (g_rebuild_msg_list)   g_rebuild_msg_list();
-                    if (g_rebuild_right_pane) g_rebuild_right_pane();
-                    return;
-                }
-
-                // ── FileChooser response (attachment selection result) ─────
-                if (std::strcmp(bcast.service_name_,
-                                "com.freebsdx.FileChooser") == 0 &&
-                    bcast.opcode_ == static_cast<uint32_t>(FileChooserOpcode::Response))
-                {
-                    FileChooserResponse resp{};
-                    std::memcpy(&resp, bcast.payload_, sizeof(resp));
-                    if (resp.request_id_ != *chooser_req || resp.cancelled_) return;
-                    if (resp.path_[0] != '\0') {
-                        compose_attachments->emplace_back(resp.path_);
-                        if (g_rebuild_right_pane) g_rebuild_right_pane();
-                    }
-                }
+                if (std::strcmp(bcast.service_name_, "com.freebsdx.Shell") != 0 ||
+                    bcast.opcode_ != static_cast<uint32_t>(ShellOpcode::LaunchWithFile)) return;
+                ShellLaunchRequest req{};
+                std::memcpy(&req, bcast.payload_, sizeof(req));
+                req.app_id_[sizeof(req.app_id_) - 1]       = '\0';
+                req.file_path_[sizeof(req.file_path_) - 1] = '\0';
+                if (std::strcmp(req.app_id_, "com.freebsdx.mail") != 0) return;
+                const std::string path = req.file_path_;
+                if (path.starts_with("mailto:") && g_open_compose) g_open_compose(path);
             });
 
-            // Drag-and-drop of .eml files or mailto: URIs
+            // Show a message read from a file, at the top of the list.
+            static auto show_eml = [](const std::string& text) {
+                MailMessage m = parseEml(text);
+                m.uid = static_cast<uint32_t>(std::time(nullptr));
+                {
+                    std::lock_guard<std::mutex> l(g_msg_mutex);
+                    g_messages.insert(g_messages.begin(), std::move(m));
+                    g_selected_msg = 0;
+                }
+                if (g_rebuild_msg_list)   g_rebuild_msg_list();
+                if (g_rebuild_right_pane) g_rebuild_right_pane();
+            };
+
+            // A dropped file is a path this sandbox can't open: ask through the
+            // picker, starting in its folder. A mailto: link needs no file.
             XApplication::setOnDrop("text/uri-list",
                 [](float, float, const std::string& data) {
                     std::string path = data;
@@ -1375,70 +1572,21 @@ int main(int argc, char** argv) {
                         if (g_open_compose) g_open_compose(path);
                         return;
                     }
-                    if (!path.ends_with(".eml")) return;
-                    std::ifstream f(path);
-                    if (!f) return;
-                    MailMessage msg_local;
-                    msg_local.uid = static_cast<uint32_t>(std::time(nullptr));
-                    std::string line;
-                    while (std::getline(f, line)) {
-                        if (!line.empty() && line.back() == '\r') line.pop_back();
-                        if (line.empty()) break;
-                        auto colon = line.find(':');
-                        if (colon == std::string::npos) continue;
-                        std::string key = line.substr(0, colon);
-                        std::string val = line.substr(colon + 2);
-                        if (key == "From")         msg_local.from     = val;
-                        else if (key == "To")      msg_local.to       = val;
-                        else if (key == "Subject") msg_local.subject  = val;
-                        else if (key == "Date")    msg_local.date_str = val;
-                    }
-                    std::ostringstream body_ss;
-                    while (std::getline(f, line)) body_ss << line << '\n';
-                    msg_local.body = body_ss.str();
-                    {
-                        std::lock_guard<std::mutex> l(g_msg_mutex);
-                        g_messages.insert(g_messages.begin(), msg_local);
-                        g_selected_msg = 0;
-                    }
-                    if (g_rebuild_msg_list)   g_rebuild_msg_list();
-                    if (g_rebuild_right_pane) g_rebuild_right_pane();
+                    if (!path.ends_with(".eml") || !g_xbus) return;
+                    XFileDialog::pickToOpen(*g_xbus, "Open Message", fs::path(path).parent_path().string(),
+                        [](XFileDialog::Picked p) {
+                            std::string text;
+                            if (p.fd && readAllFd(p.fd.get(), text)) show_eml(text);
+                        });
                 });
 
-            // Pre-load from argv[1]: mailto: URI or .eml file
-            if (!preload_path.empty()) {
-                if (preload_path.starts_with("mailto:")) {
-                    g_open_compose(preload_path);
-                } else if (preload_path.ends_with(".eml")) {
-                    std::ifstream pf(preload_path);
-                    if (pf) {
-                        MailMessage pm;
-                        pm.uid = static_cast<uint32_t>(std::time(nullptr));
-                        std::string pline;
-                        while (std::getline(pf, pline)) {
-                            if (!pline.empty() && pline.back() == '\r') pline.pop_back();
-                            if (pline.empty()) break;
-                            auto colon = pline.find(':');
-                            if (colon == std::string::npos) continue;
-                            std::string key = pline.substr(0, colon);
-                            std::string val = pline.substr(colon + 2);
-                            if (key == "From")         pm.from     = val;
-                            else if (key == "To")      pm.to       = val;
-                            else if (key == "Subject") pm.subject  = val;
-                            else if (key == "Date")    pm.date_str = val;
-                        }
-                        std::ostringstream pbody;
-                        while (std::getline(pf, pline)) pbody << pline << '\n';
-                        pm.body = pbody.str();
-                        {
-                            std::lock_guard<std::mutex> l(g_msg_mutex);
-                            g_messages.insert(g_messages.begin(), pm);
-                            g_selected_msg = 0;
-                        }
-                        g_rebuild_msg_list();
-                        g_rebuild_right_pane();
-                    }
-                }
+            // From the command line: a mailto: link, or a message file (this
+            // runs before the sandbox starts, so a path still opens).
+            if (preload_path.starts_with("mailto:")) {
+                g_open_compose(preload_path);
+            } else if (preload_path.ends_with(".eml")) {
+                std::ifstream pf(preload_path, std::ios::binary);
+                if (pf) show_eml(std::string(std::istreambuf_iterator<char>(pf), {}));
             }
 
             // Auto-sync on startup if we have an account
@@ -1448,15 +1596,12 @@ int main(int argc, char** argv) {
                 const MailAccount acct = g_accounts[g_active_account];
                 const std::string folder = g_active_folder;
                 std::thread([acct, folder]() {
-                    syncFolder(acct, folder, [](std::vector<MailMessage> msgs) {
-                        if (!msgs.empty()) {
-                            std::lock_guard<std::mutex> l(g_msg_mutex);
-                            g_messages = std::move(msgs);
-                        }
-                        g_syncing = false;
-                        if (g_rebuild_msg_list) g_rebuild_msg_list();
+                syncFolder(acct, folder, [](std::vector<MailMessage> msgs, std::string err) {
+                    XApplication::post([msgs = std::move(msgs), err = std::move(err)]() mutable {
+                        finishSync(std::move(msgs), std::move(err));
                     });
-                }).detach();
+                });
+            }).detach();
             }
         });
 }
